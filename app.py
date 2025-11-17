@@ -61,12 +61,12 @@ def infer_place_from_publisher(publisher):
 
 def format_chicago(citation_data):
     """Format citation in Chicago style"""
-    author = citation_data.get('author', '')
-    title = citation_data.get('title', '')
-    place = citation_data.get('place', '')
-    publisher = citation_data.get('publisher', '')
-    year = citation_data.get('year', '')
-    page = citation_data.get('page', '')
+    author = citation_data.get('author', '') or ''
+    title = citation_data.get('title', '') or ''
+    place = citation_data.get('place', '') or ''
+    publisher = citation_data.get('publisher', '') or ''
+    year = citation_data.get('year', '') or ''
+    page = citation_data.get('page', '') or ''
     
     citation = f"{author}, <em>{title}</em>"
     
@@ -92,16 +92,17 @@ def format_chicago(citation_data):
 
 def format_mla(citation_data):
     """Format citation in MLA style"""
-    author = citation_data.get('author', '')
-    title = citation_data.get('title', '')
-    publisher = citation_data.get('publisher', '')
-    year = citation_data.get('year', '')
-    page = citation_data.get('page', '')
+    author = citation_data.get('author', '') or ''
+    title = citation_data.get('title', '') or ''
+    publisher = citation_data.get('publisher', '') or ''
+    year = citation_data.get('year', '') or ''
+    page = citation_data.get('page', '') or ''
     
     # MLA inverts first author's name
-    author_parts = author.split(' ')
-    if len(author_parts) >= 2:
-        author = f"{author_parts[-1]}, {' '.join(author_parts[:-1])}"
+    if author:
+        author_parts = author.split(' ')
+        if len(author_parts) >= 2:
+            author = f"{author_parts[-1]}, {' '.join(author_parts[:-1])}"
     
     citation = f"{author}. <em>{title}</em>"
     if publisher:
@@ -116,18 +117,19 @@ def format_mla(citation_data):
 
 def format_apa(citation_data):
     """Format citation in APA style"""
-    author = citation_data.get('author', '')
-    title = citation_data.get('title', '')
-    place = citation_data.get('place', '')
-    publisher = citation_data.get('publisher', '')
-    year = citation_data.get('year', '')
-    page = citation_data.get('page', '')
+    author = citation_data.get('author', '') or ''
+    title = citation_data.get('title', '') or ''
+    place = citation_data.get('place', '') or ''
+    publisher = citation_data.get('publisher', '') or ''
+    year = citation_data.get('year', '') or ''
+    page = citation_data.get('page', '') or ''
     
     # APA uses initials
-    author_parts = author.split(' ')
-    if len(author_parts) >= 2:
-        initials = '. '.join([p[0] for p in author_parts[:-1]]) + '.'
-        author = f"{author_parts[-1]}, {initials}"
+    if author:
+        author_parts = author.split(' ')
+        if len(author_parts) >= 2:
+            initials = '. '.join([p[0] for p in author_parts[:-1]]) + '.'
+            author = f"{author_parts[-1]}, {initials}"
     
     citation = author
     if year:
@@ -145,6 +147,33 @@ def format_apa(citation_data):
     
     return citation
 
+def format_bluebook(citation_data):
+    """Format citation in Bluebook style"""
+    author = citation_data.get('author', '') or ''
+    title = citation_data.get('title', '') or ''
+    publisher = citation_data.get('publisher', '') or ''
+    year = citation_data.get('year', '') or ''
+    page = citation_data.get('page', '') or ''
+    
+    citation = f"{author}, " if author else ''
+    citation += title.upper() if title else 'UNTITLED'
+    
+    if page:
+        citation += f" {page}"
+    
+    if publisher or year:
+        citation += ' ('
+        if publisher:
+            citation += publisher
+        if publisher and year:
+            citation += ' '
+        if year:
+            citation += str(year)
+        citation += ')'
+    
+    citation += '.'
+    return citation
+
 def format_citation(citation_data, style):
     """Format citation according to specified style"""
     if style == 'chicago':
@@ -153,6 +182,8 @@ def format_citation(citation_data, style):
         return format_mla(citation_data)
     elif style == 'apa':
         return format_apa(citation_data)
+    elif style == 'bluebook':
+        return format_bluebook(citation_data)
     else:
         return format_chicago(citation_data)  # Default to Chicago
 
