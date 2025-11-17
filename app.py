@@ -158,7 +158,7 @@ def format_citation(citation_data, style):
 
 # ==================== CITATION LOOKUP ====================
 
-async def lookup_citation(author=None, title=None):
+ def lookup_citation(author=None, title=None):
     """Look up complete citation data from Open Library"""
     if not (author or title):
         return None
