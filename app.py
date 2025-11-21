@@ -5,15 +5,22 @@ import tempfile
 import re
 import json
 import requests
+import uuid
 import xml.dom.minidom as minidom
-from flask import Flask, render_template_string, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, session, redirect, url_for
 from werkzeug.utils import secure_filename
 from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse, unquote
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'smart-resolver-key-v2'
+app.config['SECRET_KEY'] = 'production-key-v19-style-preservation'
 
-# ==================== CONFIGURATION & DATA ====================
+# ==================== GLOBAL STORAGE ====================
+# Storage for temporary file paths, keyed by user session ID
+USER_DATA_STORE = {}
+
+# ==================== CONFIGURATION ====================
 
 PUBLISHER_PLACE_MAP = {
     'Harvard University Press': 'Cambridge, MA',
@@ -24,9 +31,6 @@ PUBLISHER_PLACE_MAP = {
     'University of California Press': 'Berkeley',
     'University of Chicago Press': 'Chicago',
     'Columbia University Press': 'New York',
-    'Cornell University Press': 'Ithaca',
-    'Duke University Press': 'Durham',
-    'Johns Hopkins University Press': 'Baltimore',
     'Oxford University Press': 'Oxford',
     'Cambridge University Press': 'Cambridge',
     'Penguin': 'New York',
@@ -38,267 +42,226 @@ PUBLISHER_PLACE_MAP = {
     'Knopf': 'New York'
 }
 
-# ==================== EMBEDDED HTML/JS DASHBOARD ====================
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>CiteResolver: Smart Review</title>
-    <style>
-        body { font-family: -apple-system, system-ui, sans-serif; max-width: 1100px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-        .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+# Maps .gov domains to proper Agency Author Names
+GOV_AGENCY_MAP = {
+    'ferc.gov': 'Federal Energy Regulatory Commission',
+    'epa.gov': 'Environmental Protection Agency',
+    'energy.gov': 'U.S. Department of Energy',
+    'doe.gov': 'U.S. Department of Energy',  # Added doe.gov mapping
+    'doi.gov': 'U.S. Department of the Interior',
+    'justice.gov': 'U.S. Department of Justice',
+    'regulations.gov': 'U.S. Government', 
+    'fda.gov': 'U.S. Food and Drug Administration',
+    'cdc.gov': 'Centers for Disease Control and Prevention',
+    'nih.gov': 'National Institutes of Health',
+    'usda.gov': 'U.S. Department of Agriculture',
+}
+
+# ==================== RELATIONSHIP MANAGER ====================
+class RelationshipManager:
+    """Handles adding URLs to word/_rels/endnotes.xml.rels"""
+    
+    def __init__(self, extract_dir):
+        self.rels_dir = os.path.join(extract_dir, 'word', '_rels')
+        self.rels_path = os.path.join(self.rels_dir, 'endnotes.xml.rels')
+        self.relationships = []
+        self.next_id = 1
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.rels_dir):
+            os.makedirs(self.rels_dir)
+        if os.path.exists(self.rels_path):
+            with open(self.rels_path, 'r', encoding='utf-8') as f:
+                dom = minidom.parseString(f.read())
+                for rel in dom.getElementsByTagName('Relationship'):
+                    rid = rel.getAttribute('Id')
+                    match = re.search(r'\d+', rid)
+                    if match:
+                        num_id = int(match.group())
+                        self.next_id = max(self.next_id, num_id + 1)
+                    self.relationships.append({
+                        'Id': rid,
+                        'Type': rel.getAttribute('Type'),
+                        'Target': rel.getAttribute('Target'),
+                        'TargetMode': rel.getAttribute('TargetMode')
+                    })
+
+    def get_or_create_hyperlink(self, url):
+        """Returns the rId for a URL, creating a new Relationship if needed"""
+        for rel in self.relationships:
+            if rel['Target'] == url and rel['Type'].endswith('/hyperlink'):
+                return rel['Id']
+        new_id = f"rId{self.next_id}"
+        self.next_id += 1
+        self.relationships.append({
+            'Id': new_id,
+            'Type': "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+            'Target': url,
+            'TargetMode': "External"
+        })
+        self._save()
+        return new_id
+
+    def _save(self):
+        """Save relationships file with proper XML formatting"""
+        impl = minidom.getDOMImplementation()
+        doc = impl.createDocument(None, None, None)
         
-        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-bottom: 20px; }
-        .controls { display: flex; gap: 15px; align-items: center; }
-        select { padding: 8px; border-radius: 4px; border: 1px solid #ddd; }
+        # Create root element with namespace
+        rels_elem = doc.createElement('Relationships')
+        rels_elem.setAttribute('xmlns', "http://schemas.openxmlformats.org/package/2006/relationships")
+        doc.appendChild(rels_elem)
         
-        .note-row { border-bottom: 1px solid #eee; padding: 20px 0; display: grid; grid-template-columns: 40px 1fr 220px; gap: 20px; }
-        .note-id { font-weight: bold; color: #888; padding-top: 10px; }
+        # Add all relationships
+        for rel in self.relationships:
+            node = doc.createElement('Relationship')
+            node.setAttribute('Id', rel['Id'])
+            node.setAttribute('Type', rel['Type'])
+            node.setAttribute('Target', rel['Target'])
+            if rel.get('TargetMode'):
+                node.setAttribute('TargetMode', rel['TargetMode'])
+            rels_elem.appendChild(node)
         
-        .input-group { display: flex; flex-direction: column; gap: 8px; }
-        .text-editor-row { display: flex; gap: 5px; }
-        input[type="text"] { padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-family: "Times New Roman", serif; font-size: 1.1em; width: 100%; box-sizing: border-box; }
-        
-        .search-bar-row { display: flex; gap: 5px; align-items: center; margin-top: 5px;}
-        .search-input { flex-grow: 1; padding: 6px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9em; color: #555; }
-        
-        .actions { display: flex; flex-direction: column; gap: 10px; }
-        button { padding: 8px 12px; cursor: pointer; border: none; border-radius: 4px; font-weight: 500; transition: 0.2s; }
-        
-        .btn-search { background: #007bff; color: white; width: 100%; }
-        .btn-search:hover { background: #0056b3; }
-        
-        .btn-clear { background: #6c757d; color: white; font-size: 0.8em; padding: 6px 10px; }
-        .btn-download { background: #28a745; color: white; padding: 12px 24px; text-decoration: none; display: inline-block; border-radius: 4px; font-weight: bold;}
-        
-        /* Results Panel */
-        .results-panel { display: none; background: #f8f9fa; padding: 10px; border-radius: 6px; margin-top: 10px; border: 1px solid #e9ecef; }
-        .result-card { background: white; padding: 10px; margin-bottom: 8px; border: 1px solid #ddd; border-radius: 4px; }
-        .result-card:hover { border-color: #007bff; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-        .result-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 5px; }
-        .result-title { font-weight: bold; color: #333; }
-        .result-meta { font-size: 0.85em; color: #666; margin-bottom: 8px; }
-        .preview-box { background: #e3f2fd; color: #0d47a1; font-size: 0.8em; padding: 4px 8px; border-radius: 3px; margin-bottom: 8px; font-family: "Times New Roman", serif;}
+        # Write with proper XML declaration
+        with open(self.rels_path, 'w', encoding='utf-8') as f:
+            # Write XML declaration manually to match Word's format
+            f.write('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n')
+            # Write the rest without the XML declaration
+            f.write(rels_elem.toxml())
 
-        .card-actions { display: flex; gap: 5px; justify-content: flex-end; }
-        .btn-replace { background: #dc3545; color: white; font-size: 0.8em; }
-        .btn-replace:hover { background: #bd2130; }
-        .btn-append { background: #28a745; color: white; font-size: 0.8em; }
-        .btn-append:hover { background: #218838; }
+# ==================== BACKEND LOGIC ====================
 
-        .loader { display: none; color: #666; font-style: italic; margin-top: 5px; font-size: 0.9em; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>CiteResolver <span style="font-size:0.5em; color:#888; font-weight:normal;">v2.0</span></h1>
-            {% if filename %}
-            <div class="controls">
-                <label>Style:</label>
-                <select id="style-selector" onchange="refreshPreviews()">
-                    <option value="chicago">Chicago (Notes)</option>
-                    <option value="mla">MLA</option>
-                    <option value="apa">APA</option>
-                </select>
-                <a href="/download" class="btn-download">Download {{ filename }}</a>
-            </div>
-            {% endif %}
-        </div>
-        
-        {% if not filename %}
-        <form action="/upload" method="post" enctype="multipart/form-data" style="text-align: center; padding: 60px;">
-            <h3>Upload Manuscript (.docx)</h3>
-            <input type="file" name="file" accept=".docx" required>
-            <br><br>
-            <button type="submit" class="btn-search" style="width: auto; padding: 12px 30px; font-size: 1.1em;">Start Review</button>
-        </form>
-        {% else %}
-
-        <div id="notes-list"></div>
-
-        <script>
-            const PUBLISHER_MAP = {{ publisher_map | tojson }};
-            let loadedNotes = [];
-
-            // Initial Load
-            fetch('/get_notes').then(r => r.json()).then(data => {
-                loadedNotes = data.notes;
-                const container = document.getElementById('notes-list');
-                
-                data.notes.forEach(note => {
-                    const div = document.createElement('div');
-                    div.className = 'note-row';
-                    div.innerHTML = `
-                        <div class="note-id">${note.id}</div>
-                        <div class="input-group">
-                            <input type="text" id="text-${note.id}" value="${note.text}">
-                            
-                            <div class="search-bar-row">
-                                <input type="text" class="search-input" id="query-${note.id}" value="${note.clean_term}" placeholder="Enter author/title to search...">
-                                <button class="btn-clear" onclick="clearQuery('${note.id}')">Clear</button>
-                            </div>
-                            
-                            <div class="loader" id="loader-${note.id}">Scanning libraries...</div>
-                            <div class="results-panel" id="results-${note.id}"></div>
-                        </div>
-                        <div class="actions">
-                            <button class="btn-search" onclick="searchCitation('${note.id}')">Find Source</button>
-                        </div>
-                    `;
-                    container.appendChild(div);
-                });
-            });
-
-            function clearQuery(id) {
-                document.getElementById(`query-${id}`).value = '';
-                document.getElementById(`query-${id}`).focus();
-            }
-
-            function searchCitation(id) {
-                const query = document.getElementById(`query-${id}`).value;
-                if (!query.trim()) return;
-
-                const loader = document.getElementById(`loader-${id}`);
-                const panel = document.getElementById(`results-${id}`);
-                
-                loader.style.display = 'block';
-                panel.style.display = 'none';
-                panel.innerHTML = '';
-
-                fetch('/search_book', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({query: query})
-                })
-                .then(r => r.json())
-                .then(data => {
-                    loader.style.display = 'none';
-                    panel.style.display = 'block';
-                    
-                    if (data.items.length === 0) {
-                        panel.innerHTML = '<div style="padding:10px; color:#666;">No results found. Try refining the search terms.</div>';
-                        return;
-                    }
-
-                    data.items.forEach(item => {
-                        const card = document.createElement('div');
-                        card.className = 'result-card';
-                        
-                        // Apply publisher mapping if city is missing
-                        if (!item.city && PUBLISHER_MAP[item.publisher]) {
-                            item.city = PUBLISHER_MAP[item.publisher];
-                        }
-
-                        const style = document.getElementById('style-selector').value;
-                        // Need to escape quotes for HTML attributes
-                        const formatted = formatCitation(item, style).replace(/'/g, "&apos;").replace(/"/g, "&quot;");
-                        // Clean version for display
-                        const displayFormatted = formatCitation(item, style);
-                        
-                        card.innerHTML = `
-                            <div class="result-header">
-                                <span class="result-title">${item.title}</span>
-                            </div>
-                            <div class="result-meta">${item.authors.join(', ')} (${item.year})</div>
-                            <div class="preview-box">${displayFormatted}</div>
-                            <div class="card-actions">
-                                <button class="btn-replace" onclick="applyCitation('${id}', '${formatted}', 'replace')">Replace All</button>
-                                <button class="btn-append" onclick="applyCitation('${id}', '${formatted}', 'append')">+ Add to Note</button>
-                            </div>
-                        `;
-                        panel.appendChild(card);
-                    });
-                });
-            }
-
-            function formatCitation(item, style) {
-                let citation = "";
-                const authors = item.authors.join(', ');
-                
-                if (style === 'chicago') {
-                    citation = `${authors}, <em>${item.title}</em>`;
-                    let pubParts = [];
-                    if (item.city) pubParts.push(item.city);
-                    if (item.publisher) pubParts.push(item.publisher);
-                    if (item.year) pubParts.push(item.year);
-                    if (pubParts.length > 0) citation += ` (${pubParts.join(': ')})`;
-                    citation += ".";
-                } 
-                else if (style === 'mla') {
-                    citation = `${authors}. <em>${item.title}</em>. ${item.publisher}, ${item.year}.`;
-                }
-                else if (style === 'apa') {
-                    citation = `${authors} (${item.year}). <em>${item.title}</em>. ${item.publisher}.`;
-                }
-                return citation;
-            }
-
-            function applyCitation(id, newText, mode) {
-                // Decode entities
-                const doc = new DOMParser().parseFromString(newText, "text/html");
-                const decodedText = doc.documentElement.textContent;
-                
-                const input = document.getElementById(`text-${id}`);
-                let finalText = "";
-
-                if (mode === 'replace') {
-                    finalText = newText; // Keep HTML tags for internal storage
-                    // For input display, strip tags
-                    input.value = decodedText;
-                } else if (mode === 'append') {
-                    const currentVal = input.value;
-                    // Check if we need a separator
-                    const separator = currentVal.trim().endsWith('.') ? " " : "; ";
-                    // Note: We can't easily mix HTML and plain text in input value
-                    // Ideally we'd store the HTML in a hidden field, but for now we append plain text 
-                    // to the input for visibility.
-                    
-                    // IMPORTANT: For "Append", we usually lose the italics in the Input Box visualization
-                    // because <input> can't show HTML. The backend will receive the plain text unless we manage it.
-                    // To fix this perfectly, we'd need a contenteditable div. 
-                    // For now, we will append the HTML version to the backend update, 
-                    // but show the plain text in the UI.
-                    
-                    finalText = currentVal + separator + decodedText; // UI Value
-                    input.value = finalText;
-                    
-                    // For the backend save, we need to actually fetch the CURRENT server state and append?
-                    // Or just send what we have. 
-                    // To keep it simple: We will send the "decodede/plain" text back for now 
-                    // OR we send the HTML version if we track it. 
-                    // Let's send the text in the input box to avoid mismatch.
-                    // (User loses italics on 'Append' in this simple version, but keeps text data).
-                }
-
-                document.getElementById(`results-${id}`).style.display = 'none';
-                
-                // Send update to server
-                fetch('/update_note', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({id: id, text: input.value}) 
-                });
-                
-                input.style.backgroundColor = "#d4edda";
-                setTimeout(() => input.style.backgroundColor = "white", 1000);
-            }
-        </script>
-        {% endif %}
-    </div>
-</body>
-</html>
-"""
-
-# ==================== BACKEND HELPERS ====================
+def get_user_data():
+    if 'user_id' not in session: return None
+    return USER_DATA_STORE.get(session['user_id'])
 
 def clean_search_term(text):
-    text = re.sub(r'^\s*\d+\.?\s*', '', text)
-    text = re.sub(r',?\s*pp?\.?\s*\d+(-\d+)?\.?$', '', text)
-    text = re.sub(r',?\s*\d+\.?$', '', text)
+    """Clean search terms for book searches - but NOT for URLs"""
+    # Check if this is a URL - if so, return it unchanged
+    if text.startswith(('http://', 'https://', 'www.')):
+        return text
+    
+    # For non-URLs, clean up book citation formatting
+    text = re.sub(r'^\s*\d+\.?\s*', '', text)  # Remove leading numbers
+    text = re.sub(r',?\s*pp?\.?\s*\d+(-\d+)?\.?$', '', text)  # Remove page numbers
+    text = re.sub(r',?\s*\d+\.?$', '', text)  # Remove trailing numbers
     return text.strip()
 
+def get_agency_name(domain):
+    """Returns the official agency name based on the domain."""
+    # Handle subdomains by checking the main domain
+    parts = domain.split('.')
+    
+    # Try the full domain first (for special cases)
+    if domain in GOV_AGENCY_MAP:
+        return GOV_AGENCY_MAP[domain]
+    
+    # Then try the root domain (last two parts)
+    if len(parts) >= 2:
+        root_domain = f"{parts[-2]}.{parts[-1]}"
+        if root_domain in GOV_AGENCY_MAP:
+            return GOV_AGENCY_MAP[root_domain]
+    
+    # Special handling for subdomains of known agencies
+    if 'doe.gov' in domain:
+        return 'U.S. Department of Energy'
+    elif 'energy.gov' in domain:
+        return 'U.S. Department of Energy'
+    
+    return "U.S. Government"
+
+def get_heuristic_title(url):
+    """Generates a title from the URL slug if scraping fails."""
+    parsed_uri = urlparse(url)
+    path = parsed_uri.path
+    slug = [s for s in path.split('/') if s][-1] if path.split('/') else ''
+    
+    clean_filename = unquote(slug).replace('_', ' ').replace('-', ' ').title()
+    
+    if clean_filename.lower().endswith(('.pdf', '.htm', '.html', '.aspx', '.asp', '.php')):
+        clean_filename = clean_filename[:-4].strip()
+        
+    if not clean_filename or len(clean_filename) < 5:
+        domain = parsed_uri.netloc.replace('www.', '')
+        return domain.split('.')[0].title() 
+        
+    return clean_filename
+
+def fetch_web_metadata(url):
+    if not url.startswith('http'): url = 'http://' + url
+    
+    try:
+        parsed_uri = urlparse(url)
+        domain = parsed_uri.netloc.replace('www.', '')
+        is_gov = domain.endswith('.gov')
+        result_type = 'gov' if is_gov else 'web'
+        
+        # Determine Agency Author Name (Guaranteed for .gov)
+        author_name = get_agency_name(domain) if is_gov else ""
+        
+        last_updated = None
+        
+        # 1. Start with Heuristic Title as the safest option
+        page_title = get_heuristic_title(url)
+        
+        # 2. Try to fetch real title from the server
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        }
+        
+        try:
+            s = requests.Session()
+            response = s.get(url, headers=headers, timeout=7, allow_redirects=True)
+            
+            if response.status_code == 200:
+                # Scrape <title>
+                title_match = re.search(r'<title>(.*?)</title>', response.text, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    raw_title = title_match.group(1).strip()
+                    if not any(block_word in raw_title for block_word in ["Just a moment", "Access Denied", "Error", "404"]):
+                         page_title = re.sub(r' \| .*$', '', raw_title).strip()
+                         
+                # Scrape Last Modified/Published Date from headers 
+                if 'Last-Modified' in response.headers:
+                    try:
+                        last_updated = datetime.strptime(response.headers['Last-Modified'][:25], '%a, %d %b %Y %H:%M:%S').strftime("%B %d, %Y")
+                    except:
+                         pass
+        except:
+            pass # Use heuristic title and generic date if request fails
+
+        # Final cleanup for output
+        access_date = datetime.now().strftime("%B %d, %Y")
+        
+        return [{
+            'type': result_type, 
+            'title': page_title, 
+            'authors': [author_name] if author_name else [], 
+            'publisher': 'U.S. Government' if is_gov else '', 
+            'year': '', 
+            'url': url, 
+            'last_updated': last_updated,
+            'access_date': access_date, 
+            'id': 'web_result'
+        }]
+    except:
+        domain = urlparse(url).netloc.replace('www.', '')
+        return [{'type': 'gov' if domain.endswith('.gov') else 'web', 
+            'title': "Web Resource (Fatal Error)", 
+            'authors': [], 
+            'publisher': '', 
+            'year': '', 
+            'url': url, 
+            'last_updated': None,
+            'access_date': datetime.now().strftime("%B %d, %Y"), 
+            'id': 'web_result_failed'
+        }]
+
 def query_google_books(query):
+    url_pattern = re.compile(r'^(http|www\.)', re.IGNORECASE)
+    if url_pattern.match(query): return fetch_web_metadata(query)
     api_url = "https://www.googleapis.com/books/v1/volumes"
     params = {'q': query, 'maxResults': 4, 'printType': 'books'}
     try:
@@ -309,6 +272,7 @@ def query_google_books(query):
             for item in data['items']:
                 info = item.get('volumeInfo', {})
                 results.append({
+                    'type': 'book',
                     'title': info.get('title', 'Unknown Title'),
                     'authors': info.get('authors', ['Unknown']),
                     'publisher': info.get('publisher', ''),
@@ -317,133 +281,316 @@ def query_google_books(query):
                     'id': item['id']
                 })
         return results
-    except:
-        return []
+    except: return []
 
-SESSION = {'temp_dir': None, 'extract_dir': None, 'endnotes_file': None, 'original_filename': None}
-
-def extract_endnotes_xml():
-    if not SESSION['endnotes_file']: return []
-    with open(SESSION['endnotes_file'], 'r', encoding='utf-8') as f:
+def extract_endnotes_xml(user_data):
+    """
+    Reads the endnotes.xml and converts complex Word markup (italics, hyperlinks) 
+    into simple HTML for the editor, preserving original link targets.
+    """
+    if not user_data or not user_data['endnotes_file']: return []
+    with open(user_data['endnotes_file'], 'r', encoding='utf-8') as f:
         dom = minidom.parseString(f.read())
     
     notes = []
+    
+    # Find the relationships file path (needed to resolve existing hyperlinks)
+    rels_path = os.path.join(user_data['extract_dir'], 'word', '_rels', 'endnotes.xml.rels')
+    relationships = {}
+    if os.path.exists(rels_path):
+        rels_dom = minidom.parse(rels_path)
+        for rel in rels_dom.getElementsByTagName('Relationship'):
+            if rel.getAttribute('Type').endswith('/hyperlink'):
+                relationships[rel.getAttribute('Id')] = rel.getAttribute('Target')
+
     for en in dom.getElementsByTagName('w:endnote'):
         en_id = en.getAttribute('w:id')
         if en_id and en_id not in ['-1', '0']:
-            text_parts = [t.firstChild.nodeValue for t in en.getElementsByTagName('w:t') if t.firstChild]
-            full_text = "".join(text_parts).strip()
-            clean_term = clean_search_term(full_text)
-            notes.append({'id': en_id, 'text': full_text, 'clean_term': clean_term})
-    return sorted(notes, key=lambda x: int(x['id']))
-
-def write_updated_note(note_id, new_text):
-    # Simple writer that handles basic italics if marked with <em>
-    path = SESSION['endnotes_file']
-    dom = minidom.parse(str(path))
-    for en in dom.getElementsByTagName('w:endnote'):
-        if en.getAttribute('w:id') == str(note_id):
+            html_parts = []
+            full_text_parts = []
+            
             p = en.getElementsByTagName('w:p')[0]
             
-            # Save reference
-            ref_run = None
-            for run in p.getElementsByTagName('w:r'):
-                if run.getElementsByTagName('w:endnoteRef'):
-                    ref_run = run
-                    break
-            
-            while p.hasChildNodes(): p.removeChild(p.firstChild)
-            
-            # Rebuild
-            pPr = dom.createElement('w:pPr')
-            pStyle = dom.createElement('w:pStyle')
-            pStyle.setAttribute('w:val', 'EndnoteText')
-            pPr.appendChild(pStyle)
-            p.appendChild(pPr)
-            
-            if ref_run:
-                p.appendChild(ref_run)
-                r = dom.createElement('w:r')
-                t = dom.createElement('w:t')
-                t.setAttribute('xml:space', 'preserve')
-                t.appendChild(dom.createTextNode(" "))
-                r.appendChild(t)
-                p.appendChild(r)
-            
-            # Split and styling
-            # Note: The frontend currently sends plain text for "Append" to keep it simple.
-            # If "Replace" is used, it might send <em> tags.
-            parts = re.split(r'(<em>.*?</em>)', new_text)
-            for part in parts:
-                if not part: continue
-                run = dom.createElement('w:r')
-                rPr = dom.createElement('w:rPr')
-                rFonts = dom.createElement('w:rFonts')
-                rFonts.setAttribute('w:ascii', 'Times New Roman')
-                rFonts.setAttribute('w:hAnsi', 'Times New Roman')
-                rPr.appendChild(rFonts)
-                run.appendChild(rPr)
+            # --- Iterate through direct children of the paragraph ---
+            for node in p.childNodes:
                 
-                clean_txt = part
-                if part.startswith('<em>'):
-                    clean_txt = part[4:-5]
-                    run.getElementsByTagName('w:rPr')[0].appendChild(dom.createElement('w:i'))
+                if node.nodeType == node.ELEMENT_NODE:
+                    
+                    # Case 1: Existing Hyperlink (<w:hyperlink>)
+                    if node.tagName == 'w:hyperlink':
+                        r_id = node.getAttribute('r:id')
+                        url = relationships.get(r_id, '#') # Get original URL target
+                        
+                        # Extract the text content from the runs inside the hyperlink
+                        link_text = ""
+                        for run in node.getElementsByTagName('w:r'):
+                            text = "".join([t.firstChild.nodeValue for t in run.getElementsByTagName('w:t') if t.firstChild])
+                            link_text += text
+                            full_text_parts.append(text)
+                            
+                        # Convert to HTML anchor tag
+                        html_parts.append(f'<a href="{url}">{link_text}</a>')
+                        continue
+
+                    # Case 2: Standard Run (<w:r>) (for plain text, spaces, or italics)
+                    if node.tagName == 'w:r':
+                        # Check for Endnote Marker and skip it
+                        if node.getElementsByTagName('w:endnoteRef'): continue
+                        
+                        text = "".join([t.firstChild.nodeValue for t in node.getElementsByTagName('w:t') if t.firstChild])
+                        if not text: continue
+                        full_text_parts.append(text)
+                        
+                        # Check Italics
+                        rPr = node.getElementsByTagName('w:rPr')
+                        is_italic = False
+                        if rPr and rPr[0].getElementsByTagName('w:i'): is_italic = True
+                        
+                        if is_italic: html_parts.append(f"<em>{text}</em>")
+                        else: html_parts.append(text)
+            
+            final_html = "".join(html_parts).strip()
+            clean_term = clean_search_term("".join(full_text_parts).strip())
+            notes.append({'id': en_id, 'html': final_html, 'clean_term': clean_term})
+            
+    return sorted(notes, key=lambda x: int(x['id']))
+
+def write_updated_note(user_data, note_id, html_content):
+    if not user_data: return
+    path = user_data['endnotes_file']
+    dom = minidom.parse(str(path))
+    rel_mgr = RelationshipManager(user_data['extract_dir'])
+    
+    for en in dom.getElementsByTagName('w:endnote'):
+        if en.getAttribute('w:id') == str(note_id):
+            # Get all paragraphs in this endnote
+            paragraphs = en.getElementsByTagName('w:p')
+            
+            # Work with the first paragraph (main content)
+            if paragraphs:
+                p = paragraphs[0]
                 
-                t_node = dom.createElement('w:t')
-                t_node.setAttribute('xml:space', 'preserve')
-                t_node.appendChild(dom.createTextNode(clean_txt))
-                run.appendChild(t_node)
-                p.appendChild(run)
+                # Find and preserve the endnote reference run
+                ref_run = None
+                for run in p.getElementsByTagName('w:r'):
+                    if run.getElementsByTagName('w:endnoteRef'):
+                        ref_run = run.cloneNode(deep=True)  # Clone to preserve all properties
+                        break
+                
+                # Clear the paragraph content but keep the paragraph element
+                while p.hasChildNodes(): 
+                    p.removeChild(p.firstChild)
+                
+                # Re-add paragraph properties with EndnoteText style
+                pPr = dom.createElement('w:pPr')
+                pStyle = dom.createElement('w:pStyle')
+                pStyle.setAttribute('w:val', 'EndnoteText')
+                pPr.appendChild(pStyle)
+                p.appendChild(pPr)
+                
+                # Re-add the endnote reference with proper style
+                if ref_run:
+                    # Ensure the reference has the proper style
+                    rPr_elements = ref_run.getElementsByTagName('w:rPr')
+                    if not rPr_elements:
+                        rPr = dom.createElement('w:rPr')
+                        rStyle = dom.createElement('w:rStyle')
+                        rStyle.setAttribute('w:val', 'EndnoteReference')
+                        rPr.appendChild(rStyle)
+                        ref_run.insertBefore(rPr, ref_run.firstChild)
+                    else:
+                        # Check if EndnoteReference style exists
+                        has_style = False
+                        for rPr in rPr_elements:
+                            if rPr.getElementsByTagName('w:rStyle'):
+                                has_style = True
+                                break
+                        if not has_style and rPr_elements:
+                            rStyle = dom.createElement('w:rStyle')
+                            rStyle.setAttribute('w:val', 'EndnoteReference')
+                            rPr_elements[0].appendChild(rStyle)
+                    
+                    p.appendChild(ref_run)
+                    
+                    # Add space after endnote reference
+                    r = dom.createElement('w:r')
+                    t = dom.createElement('w:t')
+                    t.setAttribute('xml:space', 'preserve')
+                    t.appendChild(dom.createTextNode(" "))
+                    r.appendChild(t)
+                    p.appendChild(r)
+                
+                # Parse and add the HTML content
+                tokens = re.split(r'(<a href="[^"]+">.*?</a>|<em>.*?</em>)', html_content)
+                
+                for token in tokens:
+                    if not token: continue
+                    token = token.replace('&nbsp;', ' ').replace('&amp;', '&')
+                    
+                    # Case 1: Hyperlink
+                    if token.startswith('<a href='):
+                        match = re.match(r'<a href="([^"]+)">(.*?)</a>', token)
+                        if match:
+                            url = match.group(1)
+                            text = match.group(2)
+                            
+                            r_id = rel_mgr.get_or_create_hyperlink(url)
+                            
+                            hlink = dom.createElement('w:hyperlink')
+                            hlink.setAttribute('r:id', r_id)
+                            
+                            run = dom.createElement('w:r')
+                            rPr = dom.createElement('w:rPr')
+                            
+                            # Add Hyperlink style
+                            rStyle = dom.createElement('w:rStyle')
+                            rStyle.setAttribute('w:val', 'Hyperlink')
+                            rPr.appendChild(rStyle)
+                            
+                            # Add blue color
+                            color = dom.createElement('w:color')
+                            color.setAttribute('w:val', '0000FF')
+                            rPr.appendChild(color)
+                            
+                            # Add underline
+                            u = dom.createElement('w:u')
+                            u.setAttribute('w:val', 'single')
+                            rPr.appendChild(u)
+                            
+                            run.appendChild(rPr)
+                            t = dom.createElement('w:t')
+                            t.appendChild(dom.createTextNode(text))
+                            run.appendChild(t)
+                            
+                            hlink.appendChild(run)
+                            p.appendChild(hlink)
+                            
+                            # Save relationships immediately
+                            rel_mgr._save()
+                            continue
+                    
+                    # Case 2: Regular text (italic or plain)
+                    run = dom.createElement('w:r')
+                    rPr = dom.createElement('w:rPr')
+                    
+                    # Always use Times New Roman for consistency
+                    rFonts = dom.createElement('w:rFonts')
+                    rFonts.setAttribute('w:ascii', 'Times New Roman')
+                    rFonts.setAttribute('w:hAnsi', 'Times New Roman')
+                    rPr.appendChild(rFonts)
+                    
+                    run.appendChild(rPr)
+                    
+                    text_content = token
+                    if token.startswith('<em>'):
+                        # Extract italic text
+                        text_content = token[4:-5]
+                        # Add italic formatting
+                        i_elem = dom.createElement('w:i')
+                        run.getElementsByTagName('w:rPr')[0].appendChild(i_elem)
+                    
+                    t = dom.createElement('w:t')
+                    # Preserve spaces
+                    if text_content.startswith(' ') or text_content.endswith(' '):
+                        t.setAttribute('xml:space', 'preserve')
+                    t.appendChild(dom.createTextNode(text_content))
+                    run.appendChild(t)
+                    p.appendChild(run)
+            
+            # Ensure any additional empty paragraphs have EndnoteText style
+            for para_idx in range(1, len(paragraphs)):
+                para = paragraphs[para_idx]
+                # Check if paragraph has the style
+                has_style = False
+                for pPr in para.getElementsByTagName('w:pPr'):
+                    if pPr.getElementsByTagName('w:pStyle'):
+                        has_style = True
+                        break
+                
+                if not has_style:
+                    # Add EndnoteText style
+                    pPr = dom.createElement('w:pPr')
+                    pStyle = dom.createElement('w:pStyle')
+                    pStyle.setAttribute('w:val', 'EndnoteText')
+                    pPr.appendChild(pStyle)
+                    # Insert at the beginning of the paragraph
+                    if para.firstChild:
+                        para.insertBefore(pPr, para.firstChild)
+                    else:
+                        para.appendChild(pPr)
                 
     with open(path, 'w', encoding='utf-8') as f:
         f.write(dom.toxml())
 
 # ==================== ROUTES ====================
-
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, 
-                                  filename=SESSION['original_filename'],
-                                  publisher_map=PUBLISHER_PLACE_MAP)
+    if 'user_id' not in session: session['user_id'] = str(uuid.uuid4())
+    user_data = get_user_data()
+    filename = user_data['original_filename'] if user_data else None
+    return render_template('index.html', filename=filename, publisher_map=PUBLISHER_PLACE_MAP)
 
 @app.route('/upload', methods=['POST'])
 def upload():
     file = request.files['file']
     if file:
-        if SESSION['temp_dir']: shutil.rmtree(SESSION['temp_dir'], ignore_errors=True)
-        SESSION['temp_dir'] = tempfile.mkdtemp()
-        SESSION['original_filename'] = secure_filename(file.filename)
-        input_path = os.path.join(SESSION['temp_dir'], 'source.docx')
+        if 'user_id' not in session: session['user_id'] = str(uuid.uuid4())
+        user_id = session['user_id']
+        if user_id in USER_DATA_STORE:
+            try: shutil.rmtree(USER_DATA_STORE[user_id]['temp_dir'])
+            except: pass
+        temp_dir = tempfile.mkdtemp()
+        original_filename = secure_filename(file.filename)
+        input_path = os.path.join(temp_dir, 'source.docx')
         file.save(input_path)
-        
-        SESSION['extract_dir'] = os.path.join(SESSION['temp_dir'], 'extracted')
-        with zipfile.ZipFile(input_path, 'r') as z:
-            z.extractall(SESSION['extract_dir'])
-        SESSION['endnotes_file'] = os.path.join(SESSION['extract_dir'], 'word', 'endnotes.xml')
+        extract_dir = os.path.join(temp_dir, 'extracted')
+        with zipfile.ZipFile(input_path, 'r') as z: z.extractall(extract_dir)
+        endnotes_file = os.path.join(extract_dir, 'word', 'endnotes.xml')
+        USER_DATA_STORE[user_id] = {
+            'temp_dir': temp_dir,
+            'extract_dir': extract_dir,
+            'endnotes_file': endnotes_file,
+            'original_filename': original_filename
+        }
     return index()
 
+@app.route('/reset')
+def reset():
+    user_id = session.get('user_id')
+    if user_id and user_id in USER_DATA_STORE:
+        try: shutil.rmtree(USER_DATA_STORE[user_id]['temp_dir'])
+        except: pass
+        del USER_DATA_STORE[user_id]
+    return redirect(url_for('index'))
+
 @app.route('/get_notes')
-def get_notes():
-    return jsonify({'notes': extract_endnotes_xml()})
+def get_notes(): 
+    user_data = get_user_data()
+    if not user_data: return jsonify({'notes': []})
+    return jsonify({'notes': extract_endnotes_xml(user_data)})
 
 @app.route('/search_book', methods=['POST'])
-def search_book():
-    return jsonify({'items': query_google_books(request.json['query'])})
+def search_book(): return jsonify({'items': query_google_books(request.json['query'])})
 
 @app.route('/update_note', methods=['POST'])
 def update_note():
-    write_updated_note(request.json['id'], request.json['text'])
+    user_data = get_user_data()
+    if not user_data: return jsonify({'success': False, 'error': 'Session expired'})
+    data = request.json
+    write_updated_note(user_data, data['id'], data['html'])
     return jsonify({'success': True})
 
 @app.route('/download')
 def download():
-    output = os.path.join(SESSION['temp_dir'], f"Resolved_{SESSION['original_filename']}")
+    user_data = get_user_data()
+    if not user_data: return "Session expired", 400
+    output = os.path.join(user_data['temp_dir'], f"Resolved_{user_data['original_filename']}")
     with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
-        for root, dirs, files in os.walk(SESSION['extract_dir']):
+        for root, dirs, files in os.walk(user_data['extract_dir']):
             for file in files:
                 p = os.path.join(root, file)
-                z.write(p, os.path.relpath(p, SESSION['extract_dir']))
+                z.write(p, os.path.relpath(p, user_data['extract_dir']))
     return send_file(output, as_attachment=True)
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=True, port=5000)
